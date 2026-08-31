@@ -56,7 +56,7 @@ class Model(nn.Module):
                 EncoderLayer(
                     AttentionLayer(
                         FullAttention(
-                            False, configs.factor,
+                            False,
                             attention_dropout=configs.dropout,
                             output_attention=configs.output_attention,
                         ),
@@ -75,7 +75,7 @@ class Model(nn.Module):
         #    The flattened input dim must equal the ACTUAL patch count produced by
         #    PatchEmbedding, which pads by `padding` and THEN unfolds:
         #        patch_num = (seq_len + padding - patch_len) // stride + 1
-        #    (The original formula omitted `+ padding`, so it under-counted whenever
+        #    (the first formula omitted `+ padding`, so it under-counted whenever
         #    padding > 0 and caused a Linear shape mismatch.)
         patch_num = (configs.seq_len + configs.padding - configs.patch_len) // configs.stride + 1
         self.head = DualHead(nf=configs.d_model * patch_num, dropout=configs.dropout)
