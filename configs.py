@@ -35,7 +35,6 @@ class Config:
     # --- Embedding & encoder -----------------------------------------------------
     d_model: int = 128       # hidden dimension of each patch token
     n_heads: int = 8         # attention heads (d_model must divide evenly by n_heads)
-    factor: int = 3          # attention sampling factor (accepted by FullAttention, unused)
     d_ff: int = 256          # feed-forward hidden dimension (the MLP KAN will replace later)
     e_layers: int = 3        # number of stacked encoder layers
     dropout: float = 0.1     # dropout applied to attention, FFN, and patch embedding
