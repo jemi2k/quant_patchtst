@@ -29,7 +29,7 @@ class RevIN(nn.Module):
        
         """
         args:
-            x: Input tensor of shape [Batch, Time_Steps, Channels]
+            x: Input tensor of shape [Batch, Steps, Channels]
             mode: 'norm' for scaling input, 'denorm' for unscaling output
         """
         if mode == 'norm':
@@ -62,6 +62,6 @@ class RevIN(nn.Module):
             return x
 
     def _get_statistics(self, x):
-        # calculate mean and standard deviation across the Time axis (dim=1)
+        # calculate mean and standard deviation across the axis (dim=1)
         self.mean = x.mean(dim=1, keepdim=True).detach()
         self.stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False) + self.eps).detach()
