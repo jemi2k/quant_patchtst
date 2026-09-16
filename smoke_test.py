@@ -30,25 +30,28 @@ from models.PatchTST import Model
 from train_step import pcgrad_train_step
 
 
-def make_dummy(batch, seq_len, channels):
+def make_dummy(batch, seq_len, channels, device):
     """Build synthetic input / labels / weights of the correct shapes."""
-    x = torch.randn(batch, seq_len, channels)            # [B, T, C]
-    y = (torch.rand(batch, channels, 2) > 0.5).float()   # [B, C, 2] binary 0/1
-    u_t = torch.rand(batch, channels)                    # [B, C] uniqueness in (0, 1)
+    x = torch.randn(batch, seq_len, channels, device=device)            # [B, T, C]
+    y = (torch.rand(batch, channels, 2, device=device) > 0.5).float()   # [B, C, 2] binary 0/1
+    u_t = torch.rand(batch, channels, device=device)                    # [B, C] uniqueness in (0, 1)
     return x, y, u_t
 
 
 def main():
     torch.manual_seed(0)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
+
     batch, channels = 4, 7
     cfg = Config()  # defaults: seq_len=96, patch_len=16, stride=8, padding=0
     patch_num = (cfg.seq_len + cfg.padding - cfg.patch_len) // cfg.stride + 1  # 11
 
-    x, y, u_t = make_dummy(batch, cfg.seq_len, channels)
+    x, y, u_t = make_dummy(batch, cfg.seq_len, channels, device)
 
     # --- 1. Forward pass: logit shape & finiteness ---------------------------
-    model = Model(cfg)
+    model = Model(cfg).to(device)
     model.train()
     logits = model(x)
     assert logits.shape == (batch, channels, 2), f"logits {tuple(logits.shape)} != ({batch},{channels},2)"
@@ -74,7 +77,7 @@ def main():
 
     # (b) output_attention=True -> real attention matrices
     cfg_attn = Config(output_attention=True)
-    model_attn = Model(cfg_attn)
+    model_attn = Model(cfg_attn).to(device)
     model_attn.train()
     _ = model_attn(x)
     attn_shape = (batch * channels, cfg_attn.n_heads, patch_num, patch_num)
