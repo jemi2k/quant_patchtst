@@ -26,9 +26,9 @@ class EncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
 
-    def forward(self, x, attn_mask=None, tau=None, delta=None):
+    def forward(self, x, attn_mask=None):
         # 1. Multi-Head Attention from the SelfAttention_Family.py module
-        new_x, attn = self.attention(x, x, x, attn_mask=attn_mask, tau=tau, delta=delta)
+        new_x, attn = self.attention(x, x, x, attn_mask=attn_mask)
         
         # 2. First Residual Connection & Layer Normalization
         x = x + self.dropout(new_x)
@@ -53,12 +53,12 @@ class Encoder(nn.Module):
         self.conv_layers = nn.ModuleList(conv_layers) if conv_layers is not None else None
         self.norm = norm_layer
 
-    def forward(self, x, attn_mask=None, tau=None, delta=None):
+    def forward(self, x, attn_mask=None):
         attns = []
         
         # Pass the data sequentially through Layer 1, then Layer 2, then Layer 3...
         for attn_layer in self.attn_layers:
-            x, attn = attn_layer(x, attn_mask=attn_mask, tau=tau, delta=delta)
+            x, attn = attn_layer(x, attn_mask=attn_mask)
             attns.append(attn)
 
         # final Layer Normalization over the whole stack
