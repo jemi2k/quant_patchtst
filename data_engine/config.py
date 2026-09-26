@@ -20,7 +20,7 @@ SYMBOLS = ["ETHUSDT", "SOLUSDT", "AVAXUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT", "
 # Best-effort floors: the downloader skips 404s gracefully, so a wrong value only
 # wastes a few HEAD requests and is corrected from the first-run log.
 INCEPTION = {
-    "ETHUSDT": "2019-11",
+    "ETHUSDT": "2020-01",
     "LINKUSDT": "2020-06",
     "SOLUSDT": "2021-04",
     "NEARUSDT": "2021-04",
@@ -49,9 +49,9 @@ KEEP_RAW_ZIPS = True
 
 # --- Concurrency & retries ---------------------------------------------------------
 MAX_CONCURRENT_DOWNLOADS = 8    # simultaneous aiohttp streams
-MAX_RETRIES = 3                 # attempts per file on 429/5xx/timeout
-RETRY_BACKOFF_SECONDS = (1, 2, 4)
-REQUEST_TIMEOUT_SECONDS = 60    # per-request read timeout
+MAX_RETRIES = 5                 # attempts per file on 429/5xx/timeout
+RETRY_BACKOFF_SECONDS = (1, 2, 4, 8)
+REQUEST_TIMEOUT_SECONDS = 120   # per-request read (sock_read) timeout
 
 # --- Parquet -----------------------------------------------------------------------
 PARQUET_COMPRESSION = "zstd"    # best ratio for tick data
