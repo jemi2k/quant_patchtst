@@ -97,10 +97,17 @@ def save_manifest(manifest):
 # --- Download -----------------------------------------------------------------------
 
 async def _download_zip(session, symbol, ym, semaphore):
-    """Download one monthly zip; return local path, or None if the month is absent (404)."""
+    """Download one monthly zip; return local path, or None if the month is absent (404).
+
+    Skips the download if a complete zip already exists locally (resume).
+    """
     url = config.monthly_url(symbol, ym)
     dest = config.zip_path(symbol, ym)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+    if os.path.exists(dest):
+        return dest  # already downloaded -> reuse
+
     timeout = aiohttp.ClientTimeout(sock_read=config.REQUEST_TIMEOUT_SECONDS, total=None)
 
     async with semaphore:
@@ -132,15 +139,66 @@ async def _download_zip(session, symbol, ym, semaphore):
 
 # --- Extraction + conversion ---------------------------------------------------------
 
-def _csv_to_parquet(csv_path, parquet_path):
-    """Stream a CSV into a parquet file, verifying strict agg_trade_id monotonicity."""
-    read_opts = pc.ReadOptions(block_size=64 * 1024 * 1024, use_threads=True)
+class _OrderingViolation(Exception):
+    """Trades are not in agg_trade_id order; the in-memory sort fallback repairs this."""
+
+
+def _csv_options(has_header):
+    """Shared pyarrow read/parse/convert options for streaming and sorted paths."""
+    if has_header:
+        read_opts = pc.ReadOptions(block_size=64 * 1024 * 1024, use_threads=True)
+    else:
+        # Header-less dump (older futures months): supply names, first row is data.
+        read_opts = pc.ReadOptions(block_size=64 * 1024 * 1024, use_threads=True,
+                                   column_names=config.AGGTRADES_COLUMNS)
     parse_opts = pc.ParseOptions(delimiter=",")
     convert_opts = pc.ConvertOptions(column_types={
         name: _PA_TYPES[config.AGGTRADES_DTYPES[name]]
         for name in config.AGGTRADES_COLUMNS
     })
+    return read_opts, parse_opts, convert_opts
 
+
+def _csv_to_parquet_sorted(csv_path, parquet_path, has_header=True):
+    """Fallback: load the whole CSV, sort by (transact_time, agg_trade_id),
+    drop exact duplicates, and write. Repairs out-of-order months."""
+    read_opts, parse_opts, convert_opts = _csv_options(has_header)
+    table = pc.read_csv(csv_path, read_options=read_opts, parse_options=parse_opts, convert_options=convert_opts)
+
+    actual = set(table.schema.names)
+    expected = set(config.AGGTRADES_COLUMNS)
+    if actual != expected:
+        raise ValueError(f"unexpected CSV columns {sorted(actual)} (expected {sorted(expected)})")
+
+    n_before = table.num_rows
+    table = table.sort_by([("transact_time", "ascending"), ("agg_trade_id", "ascending")])
+
+    # Drop adjacent exact duplicates (same agg_trade_id AND transact_time).
+    ids = table.column("agg_trade_id").to_numpy(zero_copy_only=False)
+    times = table.column("transact_time").to_numpy(zero_copy_only=False)
+    keep = np.ones(table.num_rows, dtype=bool)
+    if table.num_rows > 1:
+        same = (ids[1:] == ids[:-1]) & (times[1:] == times[:-1])
+        keep[1:] = ~same
+    if not keep.all():
+        table = table.filter(pa.array(keep))
+
+    pq.write_table(table, parquet_path, compression=config.PARQUET_COMPRESSION)
+
+    dropped = n_before - table.num_rows
+    if dropped:
+        logger.warning("sorted fallback dropped %d exact-duplicate rows", dropped)
+    return table.num_rows
+
+
+def _csv_to_parquet(csv_path, parquet_path, has_header=True):
+    """Stream a CSV into a parquet file.
+
+    Deduplicates adjacent duplicate agg_trade_id rows (a known Binance export
+    glitch). Raises _OrderingViolation on decreasing IDs or non-exact duplicates,
+    which the caller repairs via the in-memory sort fallback.
+    """
+    read_opts, parse_opts, convert_opts = _csv_options(has_header)
     reader = pc.open_csv(csv_path, read_options=read_opts, parse_options=parse_opts, convert_options=convert_opts)
 
     actual = set(reader.schema.names)
@@ -151,23 +209,59 @@ def _csv_to_parquet(csv_path, parquet_path):
     writer = pq.ParquetWriter(parquet_path, reader.schema, compression=config.PARQUET_COMPRESSION)
 
     row_count = 0
-    violations = 0
+    dropped = 0
     last_id = None
-    for batch in reader:
-        n = batch.num_rows
-        if n:
-            ids = batch.column("agg_trade_id").to_numpy(zero_copy_only=False)
-            if np.any(ids[1:] <= ids[:-1]):
-                violations += int(np.sum(ids[1:] <= ids[:-1]))
-            if last_id is not None and int(ids[0]) <= last_id:
-                violations += 1
-            last_id = int(ids[-1])
-        writer.write_batch(batch)
-        row_count += n
-    writer.close()
+    last_vals = None  # (transact_time, price, quantity) of the last written row
 
-    if violations:
-        raise ValueError(f"{violations} non-monotonic agg_trade_id rows")
+    try:
+        for batch in reader:
+            n = batch.num_rows
+            if n:
+                ids = batch.column("agg_trade_id").to_numpy(zero_copy_only=False)
+
+                # Strict decreases are true reordering -> sort fallback.
+                if n > 1 and np.any(ids[1:] < ids[:-1]):
+                    raise _OrderingViolation("strictly-decreasing agg_trade_id rows")
+                if last_id is not None and int(ids[0]) < last_id:
+                    raise _OrderingViolation("strictly-decreasing agg_trade_id rows at batch boundary")
+
+                # Mark adjacent duplicate agg_trade_id rows for removal (keep first).
+                drop = np.zeros(n, dtype=bool)
+                if n > 1:
+                    drop[1:] = ids[1:] == ids[:-1]
+                if last_id is not None and int(ids[0]) == last_id:
+                    drop[0] = True
+
+                if drop.any():
+                    # A duplicate must be an exact copy (same time/price/qty), never
+                    # two distinct trades that happen to share an id.
+                    for c in ("transact_time", "price", "quantity"):
+                        cur = batch.column(c).to_numpy(zero_copy_only=False)
+                        prev = np.empty(n, dtype=cur.dtype)
+                        prev[0] = last_vals[c] if last_vals is not None else cur[0]
+                        prev[1:] = cur[:-1]
+                        if (cur[drop] != prev[drop]).any():
+                            raise _OrderingViolation(f"duplicate agg_trade_id rows differ on {c}")
+                    batch = batch.filter(pa.array(~drop))
+                    dropped += int(drop.sum())
+
+                # Track the last written row for the next batch's boundary check.
+                if batch.num_rows > 0:
+                    last = batch.num_rows - 1
+                    last_id = batch.column("agg_trade_id")[last].as_py()
+                    last_vals = {
+                        "transact_time": batch.column("transact_time")[last].as_py(),
+                        "price": batch.column("price")[last].as_py(),
+                        "quantity": batch.column("quantity")[last].as_py(),
+                    }
+
+            writer.write_batch(batch)
+            row_count += batch.num_rows
+    finally:
+        writer.close()
+
+    if dropped:
+        logger.warning("dropped %d duplicate agg_trade_id rows", dropped)
 
     return row_count
 
@@ -182,8 +276,17 @@ def _convert_zip_to_parquet(zip_path, parquet_path):
                 members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                 if len(members) != 1:
                     raise ValueError(f"expected exactly 1 CSV in {os.path.basename(zip_path)}, got {len(members)}")
+                # Binance futures aggTrades are mixed-format: older months are
+                # header-less, newer ones carry a header. Peek the first line.
+                with zf.open(members[0]) as fh:
+                    first_line = fh.readline().decode("utf-8", errors="replace").strip()
+                has_header = first_line.lower().startswith("agg_trade_id")
                 csv_path = zf.extract(members[0], tmpdir)
-            row_count = _csv_to_parquet(csv_path, tmp_parquet)
+            try:
+                row_count = _csv_to_parquet(csv_path, tmp_parquet, has_header=has_header)
+            except _OrderingViolation:
+                logger.warning("out-of-order trades in %s -> in-memory sort fallback", os.path.basename(zip_path))
+                row_count = _csv_to_parquet_sorted(csv_path, tmp_parquet, has_header=has_header)
         os.replace(tmp_parquet, parquet_path)  # atomic -> resume-safe
         return row_count
     except Exception:
@@ -196,23 +299,26 @@ def _convert_zip_to_parquet(zip_path, parquet_path):
 
 async def _process(session, symbol, ym, semaphore):
     key = f"{symbol}/{ym}"
-    parquet = config.parquet_path(symbol, ym)
+    try:
+        parquet = config.parquet_path(symbol, ym)
+        if os.path.exists(parquet):
+            return {"key": key, "status": "skip"}
 
-    if os.path.exists(parquet):
-        return {"key": key, "status": "skip"}
+        zip_dest = await _download_zip(session, symbol, ym, semaphore)
+        if zip_dest is None:
+            return {"key": key, "status": "not_found"}
 
-    zip_dest = await _download_zip(session, symbol, ym, semaphore)
-    if zip_dest is None:
-        return {"key": key, "status": "not_found"}
+        rows = await asyncio.to_thread(_convert_zip_to_parquet, zip_dest, parquet)
 
-    rows = await asyncio.to_thread(_convert_zip_to_parquet, zip_dest, parquet)
+        if not config.KEEP_RAW_ZIPS:
+            os.remove(zip_dest)
 
-    if not config.KEEP_RAW_ZIPS:
-        os.remove(zip_dest)
-
-    size = os.path.getsize(parquet)
-    logger.info("%s: %d rows -> %.1f MB", key, rows, size / 1e6)
-    return {"key": key, "status": "ok", "rows": rows, "size": size}
+        size = os.path.getsize(parquet)
+        logger.info("%s: %d rows -> %.1f MB", key, rows, size / 1e6)
+        return {"key": key, "status": "ok", "rows": rows, "size": size}
+    except Exception as exc:
+        logger.error("%s FAILED: %s", key, exc, exc_info=True)
+        return {"key": key, "status": "failed"}
 
 
 # --- Main -----------------------------------------------------------------------------
