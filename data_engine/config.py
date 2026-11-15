@@ -16,18 +16,22 @@ engine, and later phases can all import it without triggering I/O.
 # Binance USDT-M perpetual futures, uppercase, one per liquid L1/Infra chain.
 SYMBOLS = ["ETHUSDT", "SOLUSDT", "AVAXUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT", "LINKUSDT"]
 
-# Approximate first available monthly archive file per symbol (YYYY-MM).
-# Best-effort floors: the downloader skips 404s gracefully, so a wrong value only
-# wastes a few HEAD requests and is corrected from the first-run log.
+# Verified first available monthly archive file per symbol (YYYY-MM).
+# Values verified against the Binance monthly aggTrades archive CONTENTS
+# (genuine trade data, not merely the existence of an archive object).
 INCEPTION = {
     "ETHUSDT": "2020-01",
-    "LINKUSDT": "2020-06",
-    "SOLUSDT": "2021-04",
-    "NEARUSDT": "2021-04",
-    "AVAXUSDT": "2021-09",
+    "LINKUSDT": "2020-01",
+    "SOLUSDT": "2020-09",
+    "NEARUSDT": "2020-10",
+    "AVAXUSDT": "2020-09",
     "APTUSDT": "2022-10",
     "SUIUSDT": "2023-05",
 }
+
+# Frozen dataset boundary: the last month included in the target dataset.
+# No wall-clock-derived defaults anywhere in the pipeline.
+DATA_END = "2026-09"
 
 # --- Archive ----------------------------------------------------------------------
 # data.binance.vision serves USDT-M futures monthly aggTrades as:
@@ -35,9 +39,11 @@ INCEPTION = {
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly/aggTrades"
 
 # --- Local storage (data/ is gitignored) ------------------------------------------
-RAW_DIR = "data/raw/aggTrades"          # downloaded zips
-PARQUET_DIR = "data/parquet/aggTrades"  # extracted + compressed (canonical store)
-MANIFEST_PATH = "data/manifest.json"    # per-file row counts / sizes / status
+RAW_DIR = "data/raw/aggTrades"             # downloaded zips (canonical source record)
+PARQUET_DIR = "data/parquet/aggTrades"     # extracted + compressed (canonical store)
+STAGING_PARQUET_DIR = "data/parquet_staging/aggTrades"  # mirrors canonical layout; promoted only after validation
+CHECKSUM_DIR = "data/checksums"            # mirrored official .zip.CHECKSUM sidecars
+MANIFEST_PATH = "data/manifest.json"       # per-file checksums / rows / sizes / status / provenance
 
 # --- Zip retention -----------------------------------------------------------------
 # df -h shows 316 GB free on / (the project partition). Rough estimate for the full
@@ -49,8 +55,8 @@ KEEP_RAW_ZIPS = True
 
 # --- Concurrency & retries ---------------------------------------------------------
 MAX_CONCURRENT_DOWNLOADS = 8    # simultaneous aiohttp streams
-MAX_RETRIES = 5                 # attempts per file on 429/5xx/timeout
-RETRY_BACKOFF_SECONDS = (1, 2, 4, 8)
+MAX_RETRIES = 8                 # attempts per file on 429/5xx/timeout/connection errors
+RETRY_BACKOFF_SECONDS = (2, 4, 8, 16, 30, 60, 120)
 REQUEST_TIMEOUT_SECONDS = 120   # per-request read (sock_read) timeout
 
 # --- Parquet -----------------------------------------------------------------------
@@ -83,11 +89,36 @@ def monthly_url(symbol: str, year_month: str) -> str:
     return f"{BASE_URL}/{symbol}/{symbol}-aggTrades-{year_month}.zip"
 
 
+def checksum_url(symbol: str, year_month: str) -> str:
+    """Remote URL of a symbol's monthly aggTrades zip checksum."""
+    return f"{BASE_URL}/{symbol}/{symbol}-aggTrades-{year_month}.zip.CHECKSUM"
+
+
+def daily_url(symbol: str, day: str) -> str:
+    """Remote URL of a symbol's daily aggTrades zip (day = YYYY-MM-DD)."""
+    return f"https://data.binance.vision/data/futures/um/daily/aggTrades/{symbol}/{symbol}-aggTrades-{day}.zip"
+
+
 def zip_path(symbol: str, year_month: str) -> str:
     """Local path where a symbol's monthly zip is stored."""
     return f"{RAW_DIR}/{symbol}/{symbol}-aggTrades-{year_month}.zip"
 
 
+def daily_zip_path(symbol: str, day: str) -> str:
+    """Local path where a symbol's daily (repair) zip is stored."""
+    return f"{RAW_DIR}/{symbol}/daily/{symbol}-aggTrades-{day}.zip"
+
+
+def checksum_path(symbol: str, year_month: str) -> str:
+    """Local path of the mirrored official checksum sidecar."""
+    return f"{CHECKSUM_DIR}/{symbol}/{symbol}-aggTrades-{year_month}.zip.CHECKSUM"
+
+
 def parquet_path(symbol: str, year_month: str) -> str:
-    """Local path where a symbol's monthly parquet is stored."""
+    """Local path where a symbol's monthly parquet is stored (canonical)."""
     return f"{PARQUET_DIR}/{symbol}/{symbol}-aggTrades-{year_month}.parquet"
+
+
+def staging_parquet_path(symbol: str, year_month: str) -> str:
+    """Local path where a symbol's monthly parquet is built (staging)."""
+    return f"{STAGING_PARQUET_DIR}/{symbol}/{symbol}-aggTrades-{year_month}.parquet"
